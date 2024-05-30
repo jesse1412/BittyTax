@@ -1,3 +1,7 @@
+# Bittytax data
+src_custom_code\data\*
+*.pdf
+
 # MacOS
 .DS_Store
 
