@@ -2,6 +2,7 @@
 # (c) Nano Nano Ltd 2022
 
 import copy
+import re
 import sys
 from decimal import Decimal
 from typing import TYPE_CHECKING, List, Union
@@ -12,6 +13,7 @@ from typing_extensions import Unpack
 from ...bt_types import TrType, UnmappedType
 from ...config import config
 from ..dataparser import DataParser, ParserArgs, ParserType
+from ..datarow import TxRawPos
 from ..exceptions import DataRowError, UnexpectedTypeError
 from ..out_record import TransactionOutRecord
 
@@ -22,18 +24,30 @@ KOINLY_D_MAPPING = {
     "": TrType.GIFT_RECEIVED,
     "Airdrop": TrType.AIRDROP,
     "airdrop": TrType.AIRDROP,
-    "Fork": TrType.GIFT_RECEIVED,
-    "fork": TrType.GIFT_RECEIVED,
+    "Fork": TrType.FORK,
+    "fork": TrType.FORK,
     "Mining": TrType.MINING,
     "mining": TrType.MINING,
-    "Reward": TrType.GIFT_RECEIVED,
-    "reward": TrType.GIFT_RECEIVED,
+    "Reward": TrType.STAKING,
+    "reward": TrType.STAKING,
     "Income": TrType.INCOME,
     "income": TrType.INCOME,
-    "Loan interest": TrType.INTEREST,
-    "loan_interest": TrType.INTEREST,
-    "Staking": TrType.STAKING,
-    "staking": TrType.STAKING,
+    "Other income": TrType.INCOME,
+    "other_income": TrType.INCOME,
+    "Lending interest": TrType.INTEREST,
+    "lending_interest": TrType.INTEREST,
+    "Cashback": TrType.CASHBACK,
+    "cashback": TrType.CASHBACK,
+    "Salary": TrType.INCOME,
+    "salary": TrType.INCOME,
+    "Fee refund": TrType.FEE_REBATE,
+    "fee_refund": TrType.FEE_REBATE,
+    "Loan": TrType.LOAN,
+    "loan": TrType.LOAN,
+    "Margin loan": TrType.LOAN,
+    "margin_loan": TrType.LOAN,
+    "Realized gain": TrType.MARGIN_GAIN,
+    "realized_gain": TrType.MARGIN_GAIN,
 }
 
 KOINLY_W_MAPPING = {
@@ -42,18 +56,28 @@ KOINLY_W_MAPPING = {
     "gift": TrType.GIFT_SENT,
     "Lost": TrType.LOST,
     "lost": TrType.LOST,
-    "Cost": TrType.SPEND,
-    "cost": TrType.SPEND,
     "Donation": TrType.CHARITY_SENT,
     "donation": TrType.CHARITY_SENT,
-    "Interest payment": TrType.SPEND,
-    "interest_payment": TrType.SPEND,
+    "Cost": TrType.SPEND,
+    "cost": TrType.SPEND,
+    "Loan fee": TrType.LOAN_INTEREST,
+    "loan_fee": TrType.LOAN_INTEREST,
+    "Margin fee": TrType.MARGIN_FEE,
+    "margin_fee": TrType.MARGIN_FEE,
+    "Loan repayment": TrType.LOAN_REPAYMENT,
+    "loan_repayment": TrType.LOAN_REPAYMENT,
+    "Margin repayment": TrType.LOAN_REPAYMENT,
+    "margin_repayment": TrType.LOAN_REPAYMENT,
+    "Realized gain": TrType.MARGIN_LOSS,
+    "realized_gain": TrType.MARGIN_LOSS,
 }
 
 
 def parse_koinly(
     data_rows: List["DataRow"], parser: DataParser, **_kwargs: Unpack[ParserArgs]
 ) -> None:
+    currency = parser.args[2].group(1)
+
     for row_index, data_row in enumerate(data_rows):
         if config.debug:
             if parser.in_header_row_num is None:
@@ -68,7 +92,7 @@ def parse_koinly(
             continue
 
         try:
-            _parse_koinly_row(data_rows, parser, data_row, row_index)
+            _parse_koinly_row(data_rows, parser, data_row, row_index, currency)
         except DataRowError as e:
             data_row.failure = e
         except (ValueError, ArithmeticError) as e:
@@ -79,21 +103,39 @@ def parse_koinly(
 
 
 def _parse_koinly_row(
-    data_rows: List["DataRow"], parser: DataParser, data_row: "DataRow", row_index: int
+    data_rows: List["DataRow"],
+    parser: DataParser,
+    data_row: "DataRow",
+    row_index: int,
+    currency: str,
 ) -> None:
     row_dict = data_row.row_dict
     data_row.timestamp = DataParser.parse_timestamp(row_dict["Date"])
+    data_row.tx_raw = TxRawPos(
+        parser.in_header.index("TxHash"),
+        parser.in_header.index("TxSrc"),
+        parser.in_header.index("TxDest"),
+    )
     data_row.parsed = True
+
+    if "Label" in row_dict:
+        row_dict["Tag"] = row_dict["Label"]
 
     if row_dict["Fee Amount"]:
         fee_quantity = Decimal(row_dict["Fee Amount"])
     else:
         fee_quantity = None
 
-    if row_dict["Fee Value (GBP)"]:
-        fee_value = Decimal(row_dict["Fee Value (GBP)"])
+    if row_dict[f"Fee Value ({currency})"]:
+        fee_value = DataParser.convert_currency(
+            row_dict[f"Fee Value ({currency})"], currency, data_row.timestamp
+        )
     else:
         fee_value = None
+
+    net_value = DataParser.convert_currency(
+        row_dict[f"Net Value ({currency})"], currency, data_row.timestamp
+    )
 
     if row_dict["Type"] in ("buy", "sell", "exchange"):
         data_row.t_record = TransactionOutRecord(
@@ -101,10 +143,10 @@ def _parse_koinly_row(
             data_row.timestamp,
             buy_quantity=Decimal(row_dict["Received Amount"]),
             buy_asset=row_dict["Received Currency"],
-            buy_value=Decimal(row_dict["Net Value (GBP)"]),
+            buy_value=net_value,
             sell_quantity=Decimal(row_dict["Sent Amount"]),
             sell_asset=row_dict["Sent Currency"],
-            sell_value=Decimal(row_dict["Net Value (GBP)"]),
+            sell_value=net_value,
             fee_quantity=fee_quantity,
             fee_asset=row_dict["Fee Currency"],
             fee_value=fee_value,
@@ -119,6 +161,7 @@ def _parse_koinly_row(
             sell_asset=row_dict["Sent Currency"],
             fee_quantity=fee_quantity,
             fee_asset=row_dict["Fee Currency"],
+            fee_value=fee_value,
             wallet=row_dict["Sending Wallet"],
             note=row_dict["Description"],
         )
@@ -134,17 +177,17 @@ def _parse_koinly_row(
         )
         data_rows.insert(row_index + 1, dup_data_row)
     elif row_dict["Type"] in ("fiat_deposit", "crypto_deposit"):
-        if row_dict["Label"] in KOINLY_D_MAPPING:
-            t_type: Union[TrType, UnmappedType] = KOINLY_D_MAPPING[row_dict["Label"]]
+        if row_dict["Tag"] in KOINLY_D_MAPPING:
+            t_type: Union[TrType, UnmappedType] = KOINLY_D_MAPPING[row_dict["Tag"]]
         else:
-            t_type = UnmappedType(f'_{row_dict["Label"]}')
+            t_type = UnmappedType(f'_{row_dict["Tag"]}')
 
         data_row.t_record = TransactionOutRecord(
             t_type,
             data_row.timestamp,
             buy_quantity=Decimal(row_dict["Received Amount"]),
             buy_asset=row_dict["Received Currency"],
-            buy_value=Decimal(row_dict["Net Value (GBP)"]),
+            buy_value=net_value,
             fee_quantity=fee_quantity,
             fee_asset=row_dict["Fee Currency"],
             fee_value=fee_value,
@@ -152,17 +195,17 @@ def _parse_koinly_row(
             note=row_dict["Description"],
         )
     elif row_dict["Type"] in ("fiat_withdrawal", "crypto_withdrawal"):
-        if row_dict["Label"] in KOINLY_W_MAPPING:
-            t_type = KOINLY_W_MAPPING[row_dict["Label"]]
+        if row_dict["Tag"] in KOINLY_W_MAPPING:
+            t_type = KOINLY_W_MAPPING[row_dict["Tag"]]
         else:
-            t_type = UnmappedType(f'_{row_dict["Label"]}')
+            t_type = UnmappedType(f'_{row_dict["Tag"]}')
 
         data_row.t_record = TransactionOutRecord(
             t_type,
             data_row.timestamp,
             sell_quantity=Decimal(row_dict["Sent Amount"]),
             sell_asset=row_dict["Sent Currency"],
-            sell_value=Decimal(row_dict["Net Value (GBP)"]),
+            sell_value=net_value,
             fee_quantity=fee_quantity,
             fee_asset=row_dict["Fee Currency"],
             fee_value=fee_value,
@@ -179,7 +222,7 @@ DataParser(
     [
         "Date",
         "Type",
-        "Label",
+        lambda h: h in ("Label", "Tag"),
         "Sending Wallet",
         "Sent Amount",
         "Sent Currency",
@@ -190,9 +233,9 @@ DataParser(
         "Received Cost Basis",
         "Fee Amount",
         "Fee Currency",
-        "Gain (GBP)",
-        "Net Value (GBP)",
-        "Fee Value (GBP)",
+        lambda h: re.match(r"Gain \((\w{3})\)", h),
+        lambda h: re.match(r"Net Value \((\w{3})\)", h),
+        lambda h: re.match(r"Fee Value \((\w{3})\)", h),
         "TxSrc",
         "TxDest",
         "TxHash",

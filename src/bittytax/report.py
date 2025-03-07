@@ -10,25 +10,34 @@ import threading
 import time
 from decimal import Decimal
 from types import TracebackType
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import jinja2
 import pkg_resources
 from colorama import Fore, Style
 from xhtml2pdf import pisa
 
-from .audit import AuditRecords
+from .audit import AuditRecords, AuditTotals
 from .bt_types import AssetName, AssetSymbol, Date, Note, Year
 from .config import config
 from .constants import _H1, ERROR, H1, TAX_RULES_UK_COMPANY
 from .price.valueasset import VaPriceReport
-from .tax import CalculateCapitalGains, CalculateIncome, HoldingsReportRecord, TaxReportRecord
+from .tax import (
+    CalculateCapitalGains,
+    CalculateIncome,
+    CalculateMarginTrading,
+    HoldingsReportRecord,
+    TaxReportRecord,
+)
 from .version import __version__
 
 
 class ReportPdf:
-    DEFAULT_FILENAME = "BittyTax_Report"
+    AUDIT_FILENAME = "BittyTax_Audit_Report"
+    TAX_SUMMARY_FILENAME = "BittyTax_Summary_Report"
+    TAX_FULL_FILENAME = "BittyTax_Report"
     FILE_EXTENSION = "pdf"
+
     AUDIT_TEMPLATE = "audit_report.html"
     TAX_SUMMARY_TEMPLATE = "tax_summary_report.html"
     TAX_FULL_TEMPLATE = "tax_full_report.html"
@@ -43,7 +52,6 @@ class ReportPdf:
         holdings_report: Optional[HoldingsReportRecord] = None,
     ) -> None:
         self.env = jinja2.Environment(loader=jinja2.PackageLoader("bittytax", "templates"))
-        self.filename = self.get_output_filename(args.output_filename, self.FILE_EXTENSION)
 
         self.env.filters["datefilter"] = self.datefilter
         self.env.filters["datefilter2"] = self.datefilter2
@@ -53,10 +61,13 @@ class ReportPdf:
         self.env.filters["ratesfilter"] = self.ratesfilter
         self.env.filters["nowrapfilter"] = self.nowrapfilter
         self.env.filters["lenfilter"] = self.lenfilter
+        self.env.filters["audittotalsfilter"] = self.audittotalsfilter
+        self.env.filters["mismatchfilter"] = self.mismatchfilter
         self.env.globals["TAX_RULES_UK_COMPANY"] = TAX_RULES_UK_COMPANY
         self.env.globals["TEMPLATE_PATH"] = pkg_resources.resource_filename(__name__, "templates")
 
         if args.audit_only:
+            filename = self.get_output_filename(args.output_filename, self.AUDIT_FILENAME)
             template = self.env.get_template(self.AUDIT_TEMPLATE)
             html = template.render(
                 {
@@ -68,6 +79,7 @@ class ReportPdf:
                 }
             )
         elif args.summary_only:
+            filename = self.get_output_filename(args.output_filename, self.TAX_SUMMARY_FILENAME)
             template = self.env.get_template(self.TAX_SUMMARY_TEMPLATE)
             html = template.render(
                 {
@@ -79,6 +91,7 @@ class ReportPdf:
                 }
             )
         else:
+            filename = self.get_output_filename(args.output_filename, self.TAX_FULL_FILENAME)
             template = self.env.get_template(self.TAX_FULL_TEMPLATE)
             html = template.render(
                 {
@@ -93,14 +106,14 @@ class ReportPdf:
                 }
             )
 
-        with ProgressSpinner():
-            with open(self.filename, "w+b") as pdf_file:
+        with ProgressSpinner(f"{Fore.CYAN}generating PDF report{Fore.GREEN}: "):
+            with open(filename, "w+b") as pdf_file:
                 status = pisa.CreatePDF(html, dest=pdf_file)
 
         if not status.err:
-            print(f"{Fore.WHITE}PDF tax report created: {Fore.YELLOW}{self.filename}")
+            print(f"{Fore.WHITE}PDF report created: {Fore.YELLOW}{os.path.abspath(filename)}")
         else:
-            print(f"{ERROR} Failed to create PDF tax report")
+            print(f"{ERROR} Failed to create PDF report")
 
     @staticmethod
     def datefilter(date: Date) -> str:
@@ -145,13 +158,36 @@ class ReportPdf:
         return text[: max_len - dots] + "." * dots if len(text) > max_len else text
 
     @staticmethod
-    def get_output_filename(filename: str, extension_type: str) -> str:
+    def audittotalsfilter(
+        audit_totals_list: List[Tuple[AssetSymbol, AuditTotals]], fiat_only: bool = False
+    ) -> List[Tuple[AssetSymbol, AuditTotals]]:
+        for asset, audit_totals in list(audit_totals_list):
+            if config.audit_hide_empty:
+                if not audit_totals.total and not audit_totals.transfers_mismatch:
+                    audit_totals_list.remove((asset, audit_totals))
+                    continue
+
+            if fiat_only and asset not in config.fiat_list:
+                audit_totals_list.remove((asset, audit_totals))
+            elif not fiat_only and asset in config.fiat_list:
+                audit_totals_list.remove((asset, audit_totals))
+
+        return audit_totals_list
+
+    @staticmethod
+    def mismatchfilter(quantity: Decimal) -> str:
+        if quantity:
+            return f"{quantity.normalize():+0,f}"
+        return ""
+
+    @staticmethod
+    def get_output_filename(filename: str, default_filename: str) -> str:
         if filename:
             filepath, file_extension = os.path.splitext(filename)
-            if file_extension != extension_type:
-                filepath = filepath + "." + extension_type
+            if file_extension != ReportPdf.FILE_EXTENSION:
+                filepath = filepath + "." + ReportPdf.FILE_EXTENSION
         else:
-            filepath = ReportPdf.DEFAULT_FILENAME + "." + extension_type
+            filepath = default_filename + "." + ReportPdf.FILE_EXTENSION
 
         if not os.path.exists(filepath):
             return filepath
@@ -167,7 +203,7 @@ class ReportPdf:
 
 
 class ReportLog:
-    MAX_SYMBOL_LEN = 8
+    MAX_SYMBOL_LEN = 20
     MAX_NAME_LEN = 32
     MAX_NOTE_LEN = 40
     ASSET_WIDTH = MAX_SYMBOL_LEN + MAX_NAME_LEN + 3
@@ -214,13 +250,13 @@ class ReportLog:
     def _tax_full(
         self,
         tax_rules: str,
-        audit_report: AuditRecords,
+        audit: AuditRecords,
         tax_report: Dict[Year, TaxReportRecord],
         price_report: Dict[Year, Dict[AssetSymbol, Dict[Date, VaPriceReport]]],
         holdings_report: Optional[HoldingsReportRecord],
     ) -> None:
         print(f"{Fore.WHITE}tax report output:")
-        self._audit(audit_report)
+        self._audit(audit)
 
         for tax_year in sorted(tax_report):
             print(
@@ -238,6 +274,7 @@ class ReportLog:
                 self._cgt_estimate(tax_report[tax_year]["CapitalGains"])
 
             self._income(tax_report[tax_year]["Income"])
+            self._margin_trading(tax_report[tax_year]["MarginTrading"])
 
         print(f"{H1}Appendix{_H1}")
         for tax_year in sorted(tax_report):
@@ -255,17 +292,44 @@ class ReportLog:
         if holdings_report:
             self._holdings(holdings_report)
 
-    def _audit(self, audit_report: AuditRecords) -> None:
+    def _audit(self, audit: AuditRecords) -> None:
         print(f"{H1}Audit{_H1}")
-        print(f"{Fore.CYAN}Final Balances")
-        for wallet in sorted(audit_report.wallets, key=str.lower):
+        print(f"{Fore.CYAN}Wallet Balances")
+        for wallet in sorted(audit.wallets, key=str.lower):
             print(f'\n{Fore.YELLOW}{"Wallet":<30} {"Asset":<{self.MAX_SYMBOL_LEN}} {"Balance":>25}')
 
-            for asset in sorted(audit_report.wallets[wallet]):
+            for asset in sorted(audit.wallets[wallet]):
                 print(
                     f"{Fore.WHITE}{wallet:<30} {asset:<{self.MAX_SYMBOL_LEN}} "
-                    f"{self.format_quantity(audit_report.wallets[wallet][asset]):>25}"
+                    f"{Fore.RED if audit.wallets[wallet][asset] < 0 else Fore.WHITE}"
+                    f"{self.format_quantity(audit.wallets[wallet][asset]):>25}"
                 )
+
+        print(f"\n{Fore.CYAN}Asset Balances (Cryptoassets)")
+        print(
+            f'\n{Fore.YELLOW}{"Asset":<{self.MAX_SYMBOL_LEN}} {"Balance":>25} '
+            f'{"Transfers Mismatch":>25}'
+        )
+        for asset, audit_totals in sorted(filter(self.filter_audit_totals, audit.totals.items())):
+            print(
+                f"{Fore.WHITE}{asset:<{self.MAX_SYMBOL_LEN}} "
+                f"{Fore.RED if audit_totals.total < 0 else Fore.WHITE}"
+                f"{self.format_quantity(audit_totals.total):>25} "
+                f"{Fore.RED}{self.format_mismatch(audit_totals.transfers_mismatch):>25}"
+            )
+
+        print(f"\n{Fore.CYAN}Asset Balances (Fiat Currency)")
+        print(f'\n{Fore.YELLOW}{"Asset":<{self.MAX_SYMBOL_LEN}} {"Balance":>25}')
+        for asset, audit_totals in sorted(
+            filter(
+                lambda pair: self.filter_audit_totals(pair, fiat_only=True), audit.totals.items()
+            )
+        ):
+            print(
+                f"{Fore.WHITE}{asset:<{self.MAX_SYMBOL_LEN}} "
+                f"{Fore.RED if audit_totals.total < 0 else Fore.WHITE}"
+                f"{self.format_quantity(audit_totals.total):>25}"
+            )
 
     def _capital_gains(self, cgains: CalculateCapitalGains) -> None:
         header = (
@@ -319,7 +383,6 @@ class ReportLog:
                     "*", f"{Fore.YELLOW}*{Fore.WHITE}"
                 )
             )
-
         else:
             print(
                 f'{Fore.WHITE}{"Disposal proceeds:":<40} '
@@ -422,7 +485,6 @@ class ReportLog:
         )
 
         print(f"{Fore.YELLOW}{header}")
-
         for asset in sorted(income.assets):
             events = quantity = amount = fees = Decimal(0)
             for te in income.assets[asset]:
@@ -460,6 +522,33 @@ class ReportLog:
             f'{Fore.YELLOW}{Style.BRIGHT}{"Total":<{self.MAX_SYMBOL_LEN + 11}} {"":<10} '
             f'{"":<40} {"":<25} {self.format_value(income.totals["amount"]):>13} '
             f'{self.format_value(income.totals["fees"]):>13}{Style.NORMAL}'
+        )
+
+    def _margin_trading(self, margin: CalculateMarginTrading) -> None:
+        print(f"\n{Fore.CYAN}Margin Trading\n")
+        print("These figures are NOT included in the Summary or Tax Estimate above.\n")
+        header = f'{"Wallet":<30} {"Contract":<40} {"Gains":>13} {"Losses":>13} {"Fees":>13}'
+
+        print(f"{Fore.YELLOW}{header}")
+        for wallet, note in sorted(
+            margin.contract_totals, key=lambda key: (key[0].lower(), key[1].lower())
+        ):
+            print(
+                f"{Fore.WHITE}{wallet:<30} "
+                f"{Fore.WHITE}{self.format_note(note):<40} "
+                f'{self.format_value(margin.contract_totals[(wallet, note)]["gains"]):>13} '
+                f'{self.format_value(margin.contract_totals[(wallet, note)]["losses"]):>13} '
+                f'{self.format_value(margin.contract_totals[(wallet, note)]["fees"]):>13}'
+                f"{Style.NORMAL}"
+            )
+
+        print(f'{Fore.YELLOW}{"_" * len(header)}')
+        print(
+            f'{Fore.YELLOW}{Style.BRIGHT}{"Total":<30} '
+            f'{"":<40} '
+            f'{self.format_value(margin.totals["gains"]):>13} '
+            f'{self.format_value(margin.totals["losses"]):>13} '
+            f'{self.format_value(margin.totals["fees"]):>13}{Style.NORMAL}'
         )
 
     def _price_data(self, price_report: Dict[AssetSymbol, Dict[Date, VaPriceReport]]) -> None:
@@ -571,9 +660,29 @@ class ReportLog:
             else note
         )
 
+    @staticmethod
+    def format_mismatch(quantity: Decimal) -> str:
+        if quantity:
+            return f"{quantity.normalize():+0,f}"
+        return ""
+
+    @staticmethod
+    def filter_audit_totals(pair: Tuple[AssetSymbol, AuditTotals], fiat_only: bool = False) -> bool:
+        asset, audit_totals = pair
+        if config.audit_hide_empty:
+            if not audit_totals.total and not audit_totals.transfers_mismatch:
+                return False
+
+        if fiat_only and asset not in config.fiat_list:
+            return False
+        if not fiat_only and asset in config.fiat_list:
+            return False
+        return True
+
 
 class ProgressSpinner:
-    def __init__(self) -> None:
+    def __init__(self, message: str) -> None:
+        self.message = message
         self.spinner = itertools.cycle(["-", "\\", "|", "/"])
         self.busy = False
 
@@ -582,13 +691,14 @@ class ProgressSpinner:
             sys.stdout.write(next(self.spinner))
             sys.stdout.flush()
             time.sleep(0.1)
-            sys.stdout.write("\b")
-            sys.stdout.flush()
+            if self.busy:
+                sys.stdout.write("\b")
+                sys.stdout.flush()
 
     def __enter__(self) -> None:
         if sys.stdout.isatty():
             self.busy = True
-            sys.stdout.write(f"{Fore.CYAN}generating PDF report{Fore.GREEN}: ")
+            sys.stdout.write(self.message)
             threading.Thread(target=self.do_spinner).start()
 
     def __exit__(

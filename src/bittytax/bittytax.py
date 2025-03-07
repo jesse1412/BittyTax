@@ -13,7 +13,8 @@ import colorama
 from colorama import Fore
 
 from .audit import AuditRecords
-from .bt_types import AssetSymbol, Year
+from .audit_excel import AuditLogExcel
+from .bt_types import AssetSymbol, DisposalType, Year
 from .config import config
 from .constants import ERROR, TAX_RULES_UK_COMPANY, TAX_RULES_UK_INDIVIDUAL, WARNING
 from .exceptions import ImportFailureError
@@ -22,15 +23,15 @@ from .holdings import Holdings
 from .import_records import ImportRecords
 from .price.exceptions import DataSourceError
 from .price.valueasset import ValueAsset
-from .record import TransactionRecord
 from .report import ReportLog, ReportPdf
+from .t_record import TransactionRecord
 from .tax import CalculateCapitalGains as CCG
 from .tax import TaxCalculator
 from .transactions import TransactionHistory
 from .version import __version__
 
 if sys.stdout.encoding != "UTF-8":
-    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
 
 
 def main() -> None:
@@ -91,7 +92,7 @@ def main() -> None:
         "-o",
         dest="output_filename",
         type=str,
-        help="specify the output filename for the tax report",
+        help="specify the output filename for the PDF report",
     )
     parser.add_argument(
         "--nopdf",
@@ -111,6 +112,8 @@ def main() -> None:
         print(f"{Fore.YELLOW}{parser.prog} v{__version__}")
         print(f"{Fore.GREEN}python: v{platform.python_version()}")
         print(f"{Fore.GREEN}system: {platform.system()}, release: {platform.release()}")
+        for arg in vars(args):
+            print(f"{Fore.GREEN}args: {arg}: {getattr(args, arg)}")
         config.output_config(sys.stdout)
 
     if args.tax_rules in TAX_RULES_UK_COMPANY:
@@ -131,6 +134,10 @@ def main() -> None:
     audit = AuditRecords(transaction_records)
 
     if args.audit_only:
+        if audit.audit_log:
+            audit_log_excel = AuditLogExcel(parser.prog, audit.audit_log)
+            audit_log_excel.write_excel()
+
         if args.nopdf:
             ReportLog(args, audit)
         else:
@@ -145,6 +152,7 @@ def main() -> None:
 
             if not args.summary_only:
                 tax.process_income()
+                tax.process_margin_trades()
 
             _do_each_tax_year(tax, args.tax_year, args.summary_only, value_asset)
 
@@ -186,7 +194,7 @@ def _do_import(filename: str) -> List[TransactionRecord]:
             import_records.import_excel_xls(filename)
         else:
             with io.open(filename, newline="", encoding="utf-8") as csv_file:
-                import_records.import_csv(csv_file)
+                import_records.import_csv(csv_file, filename)
     else:
         import_records.import_csv(sys.stdin)
 
@@ -209,12 +217,12 @@ def _do_tax(
 
     tax = TaxCalculator(transaction_history.transactions, tax_rules)
     tax.pool_same_day()
-    tax.match_sell(tax.DISPOSAL_SAME_DAY)
+    tax.match_sell(DisposalType.SAME_DAY)
 
     if tax_rules == TAX_RULES_UK_INDIVIDUAL:
-        tax.match_buyback(tax.DISPOSAL_BED_AND_BREAKFAST)
+        tax.match_buyback(DisposalType.BED_AND_BREAKFAST)
     elif tax_rules in TAX_RULES_UK_COMPANY:
-        tax.match_sell(tax.DISPOSAL_TEN_DAY)
+        tax.match_sell(DisposalType.TEN_DAY)
 
     tax.process_section104(skip_integrity_check)
     return tax, value_asset
@@ -267,7 +275,12 @@ def _do_each_tax_year(
             tax.tax_report[tax_year] = {"CapitalGains": calc_cgt}
         else:
             calc_income = tax.calculate_income(tax_year)
-            tax.tax_report[tax_year] = {"CapitalGains": calc_cgt, "Income": calc_income}
+            calc_margin_trading = tax.calculate_margin_trading(tax_year)
+            tax.tax_report[tax_year] = {
+                "CapitalGains": calc_cgt,
+                "Income": calc_income,
+                "MarginTrading": calc_margin_trading,
+            }
     else:
         # Calculate for all years
         for year in sorted(tax.tax_events):
@@ -279,7 +292,12 @@ def _do_each_tax_year(
                     tax.tax_report[year] = {"CapitalGains": calc_cgt}
                 else:
                     calc_income = tax.calculate_income(year)
-                    tax.tax_report[year] = {"CapitalGains": calc_cgt, "Income": calc_income}
+                    calc_margin_trading = tax.calculate_margin_trading(year)
+                    tax.tax_report[year] = {
+                        "CapitalGains": calc_cgt,
+                        "Income": calc_income,
+                        "MarginTrading": calc_margin_trading,
+                    }
             else:
                 print(f"{WARNING} Tax year {year} is not supported")
 
